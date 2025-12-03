@@ -292,40 +292,68 @@ httpd_home=/usr/share/kismet/httpd/
 EOF
   $SUDO chmod 644 "$KISMET_MAIN"
 
-  # --- Build kismet_site.conf cumulatively (Wi-Fi + BT) ----------------------
-  EXCLUDE_IF="wlo1"   # internal NIC; don't touch this one
+  # --- Build kismet_site.conf cumulatively (Wi-Fi + BT) ------------------------
+  # Any wlx* is considered a USB Wi-Fi dongle; we do NOT fall back to builtin NICs.
+  # We will:
+  #   - Use existing wlx* monitor interfaces directly
+  #   - Convert wlx* managed interfaces into monitor mode (in-place or via IFmon)
+  EXCLUDE_IF_REGEX='^(wlo1|wlp2s0)$'   # internal NICs; do not touch
 
-  # Detect USB Wi-Fi dongles via iw dev (only wlx* managed interfaces)
-  WIFI_IFACES=()
+  WIFI_SOURCES=()
+  WIFI_BASE_IFACES=()
+
+  # Parse iw dev output: "iface type" lines
   while read -r IFACE TYPE; do
-    if [[ "$IFACE" =~ ^wlx.*$ ]] && [[ "$TYPE" == "managed" ]]; then
-      [[ "$IFACE" == "$EXCLUDE_IF" ]] && continue
-      WIFI_IFACES+=("$IFACE")
+    # Only care about wlx* (USB) and not excluded ones
+    if [[ "$IFACE" =~ ^wlx ]] && ! [[ "$IFACE" =~ $EXCLUDE_IF_REGEX ]]; then
+      if [[ "$TYPE" == "monitor" ]]; then
+        # already monitor; just use it
+        WIFI_SOURCES+=("$IFACE")
+      elif [[ "$TYPE" == "managed" ]]; then
+        # managed; we will try to convert/create a monitor
+        WIFI_BASE_IFACES+=("$IFACE")
+      fi
     fi
   done < <($SUDO iw dev 2>/dev/null | awk '/Interface/ {iface=$2} /type/ {print iface, $2}')
 
-  if [[ ${#WIFI_IFACES[@]} -eq 0 ]]; then
+  if [[ ${#WIFI_SOURCES[@]} -eq 0 && ${#WIFI_BASE_IFACES[@]} -eq 0 ]]; then
     echo "==> No wlx* USB Wi-Fi dongles detected; Kismet will run without Wi-Fi sources."
   else
-    echo "==> Found USB Wi-Fi IFs: ${WIFI_IFACES[*]}"
+    echo "==> Found USB Wi-Fi IFs (managed): ${WIFI_BASE_IFACES[*]:-none}"
+    echo "==> Existing monitor IFs:          ${WIFI_SOURCES[*]:-none}"
   fi
 
-  # Create monitor interfaces for each detected wlx* and collect as Wi-Fi sources
-  WIFI_SOURCES=()
-  for IF in "${WIFI_IFACES[@]}"; do
+  # For each managed wlx*, create or convert to a monitor interface and add to sources
+  for IF in "${WIFI_BASE_IFACES[@]}"; do
     MON="${IF}mon"
 
-    # Kill conflicting processes before switching to monitor mode
-    $SUDO airmon-ng check kill >/dev/null 2>&1 || true
+    # If a dedicated MON iface already exists, just bring it up and use it
+    if $SUDO iw dev 2>/dev/null | awk '/Interface/ {n=$2} /type/ {if ($2=="monitor" && n=="'"$MON"'") {print; exit}}' | grep -q .; then
+      $SUDO ip link set "$MON" up 2>/dev/null || true
+      WIFI_SOURCES+=("$MON")
+      continue
+    fi
 
-    # Set interface down, change type to monitor, bring it up
+    # Otherwise, try to convert the base iface to monitor in-place first
     $SUDO ip link set "$IF" down 2>/dev/null || true
-    $SUDO iw dev "$IF" set type monitor 2>/dev/null || true
-    $SUDO ip link set "$IF" up 2>/dev/null || true
+    if $SUDO iw dev "$IF" set type monitor 2>/dev/null; then
+      $SUDO ip link set "$IF" up 2>/dev/null || true
+      # Confirm it's now monitor
+      if $SUDO iw dev 2>/dev/null | awk '/Interface/ {n=$2} /type/ {if ($2=="monitor" && n=="'"$IF"'") {print; exit}}' | grep -q .; then
+        WIFI_SOURCES+=("$IF")
+        continue
+      fi
+    fi
 
-    # Verify it exists as a monitor interface
-    if $SUDO iw dev | awk '/Interface/ {n=$2} /type/ {if ($2=="monitor" && n=="'"$IF"'") {print; exit}}' | grep -q .; then
-      WIFI_SOURCES+=("$IF")
+    # If in-place conversion failed, fall back to creating a separate MON iface
+    if ! $SUDO iw dev 2>/dev/null | awk '/Interface/ {n=$2} /type/ {if ($2=="monitor" && n=="'"$MON"'") {print; exit}}' | grep -q .; then
+      $SUDO iw dev "$IF" interface add "$MON" type monitor 2>/dev/null || true
+      $SUDO ip link set "$MON" up 2>/dev/null || true
+    fi
+
+    # Verify the MON iface exists as monitor and add it
+    if $SUDO iw dev 2>/dev/null | awk '/Interface/ {n=$2} /type/ {if ($2=="monitor" && n=="'"$MON"'") {print; exit}}' | grep -q .; then
+      WIFI_SOURCES+=("$MON")
     fi
   done
 
@@ -355,6 +383,7 @@ EOF
     echo "source=${H}:name=${H}" | $SUDO tee -a "$KISMET_SITE" >/dev/null
   done
   $SUDO chmod 644 "$KISMET_SITE"
+  # --------------------- end Wi-Fi+BT block; next is systemd unit -------------
 
   # --- Kismet HTTPD user + config location (admin/admin123) ------------------
   # Make Kismet use /etc/kismet as HOME so ~/.kismet lives under /etc
