@@ -401,7 +401,7 @@ EOF
   # Use HOME override so kismet_httpd.conf ends up under /etc/kismet/.kismet/
   # (which symlinks back into /etc/kismet)
   $SUDO HOME="$KISMET_CONF_DIR" timeout 20 kismet --no-ncurses --create-user "admin:admin123:admin" >/dev/null 2>&1 || true
-  
+
   echo "==> Ensuring Kismet HTTPD config is persistent..."
 
   # Make sure /root/.kismet exists
@@ -563,25 +563,24 @@ EOF
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable --now kismet_retriever milesight_retriever || true
 
-# --- S3 uploader service (replaces old cron job entirely) --------------------
+# --- S3 uploader service + timer (replaces cron entirely) ---------------------
 if [[ "$SKIP_S3_CRON" -eq 0 ]]; then
-  echo "==> Configuring S3 uploader service (cron disabled permanently)."
+  echo "==> Installing S3 upload service + timer"
 
-  # Ensure directories exist
+  # Ensure data directories exist
   $SUDO mkdir -p "$KISMET_DATA_DIR" "$MILESIGHT_DATA_DIR"
 
-  # Ensure the uploader script is in place
+  # Ensure uploader script exists (repo should copy it to /usr/local/bin)
   if [[ -f /usr/local/bin/retriever-upload-gz.sh ]]; then
     echo "==> Uploader script present at /usr/local/bin/retriever-upload-gz.sh"
+    $SUDO chmod +x /usr/local/bin/retriever-upload-gz.sh
   else
-    echo "==> ERROR: retriever-upload-gz.sh missing — service will not work."
-    echo "           Ensure project-box-hawk repo contains retriever-upload-gz.sh in root."
+    echo "==> ERROR: retriever-upload-gz.sh missing — S3 uploads will fail."
   fi
 
-  # Create the service unit if it does not exist yet
-  if [[ ! -f /etc/systemd/system/retriever-upload.service ]]; then
-    echo "==> Creating retriever-upload.service unit"
-    $SUDO tee /etc/systemd/system/retriever-upload.service >/dev/null <<'EOF'
+  # --- Create the systemd service ------------------------------------------
+  echo "==> Creating retriever-upload.service"
+  $SUDO tee /etc/systemd/system/retriever-upload.service >/dev/null <<'EOF'
 [Unit]
 Description=Retriever S3 GZ uploader
 After=network-online.target
@@ -591,23 +590,34 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/bin/retriever-upload-gz.sh
 Nice=10
+EOF
+
+  # --- Create the systemd timer --------------------------------------------
+  echo "==> Creating retriever-upload.timer"
+  $SUDO tee /etc/systemd/system/retriever-upload.timer >/dev/null <<'EOF'
+[Unit]
+Description=Run Retriever S3 uploader every minute
+
+[Timer]
+OnBootSec=30sec
+OnUnitActiveSec=60sec
+AccuracySec=10sec
+Unit=retriever-upload.service
+Persistent=true
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=timers.target
 EOF
-  else
-    echo "==> retriever-upload.service already exists; leaving unit definition as-is."
-  fi
 
-  # Enable + start the uploader service (typically triggered at boot or by timer)
+  # Reload, enable, and start timer
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now retriever-upload.service || {
-    echo "==> ERROR: Failed to start retriever-upload.service"
+  $SUDO systemctl enable --now retriever-upload.timer || {
+    echo "==> ERROR: Failed to start retriever-upload.timer"
   }
 
-  echo "==> S3 upload service installed & active. Cron is no longer used."
+  echo "==> S3 upload service & timer installed and active."
 else
-  echo "==> --skip-s3-cron: Skipping S3 uploader service activation."
+  echo "==> --skip-s3-cron: Skipping S3 uploader service + timer."
 fi
 
 # --- summary ------------------------------------------------------------------
@@ -620,6 +630,8 @@ echo "Kismet:              $(systemctl is-active kismet 2>/dev/null || echo inac
 echo "kismet_retriever:    $(systemctl is-active kismet_retriever 2>/dev/null || echo inactive)"
 echo "milesight_retriever: $(systemctl is-active milesight_retriever 2>/dev/null || echo inactive)"
 echo "Zabbix agent:        $(systemctl is-active zabbix-agent 2>/dev/null || echo inactive)"
+echo "Uploader Service:   $(systemctl is-active retriever-upload.service 2>/dev/null || echo inactive)"
+echo "Uploader Timer:     $(systemctl is-active retriever-upload.timer 2>/dev/null || echo inactive)"
 echo "Node exporter:       $(systemctl is-active prometheus-node-exporter 2>/dev/null || echo inactive)"
 if [[ "$SKIP_TAILSCALE" -eq 0 ]]; then
   echo "Tailscale:           $(systemctl is-active tailscaled 2>/dev/null || echo inactive)"
